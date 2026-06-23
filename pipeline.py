@@ -1,8 +1,11 @@
 from detection.llm_signal import get_llm_score
 from detection.stylometric import get_stylometric_score
+from detection.readability_signal import get_readability_score
 
-LLM_WEIGHT = 0.60
-STYLO_WEIGHT = 0.40
+# Ensemble weights — must sum to 1.0
+LLM_WEIGHT = 0.50
+STYLO_WEIGHT = 0.30
+READABILITY_WEIGHT = 0.20
 
 THRESHOLD_AI = 0.65
 THRESHOLD_HUMAN = 0.35
@@ -11,11 +14,23 @@ THRESHOLD_HUMAN = 0.35
 def analyze(text: str) -> dict:
     llm_result = get_llm_score(text)
     stylo_result = get_stylometric_score(text)
+    readability_result = get_readability_score(text)
 
     llm_score = llm_result["score"]
     stylo_score = stylo_result["score"]
+    readability_score = readability_result["score"]
 
-    combined_score = round((LLM_WEIGHT * llm_score) + (STYLO_WEIGHT * stylo_score), 4)
+    combined_score = round(
+        (LLM_WEIGHT * llm_score) +
+        (STYLO_WEIGHT * stylo_score) +
+        (READABILITY_WEIGHT * readability_score),
+        4
+    )
+
+    # Conflict detection: flag when signals disagree significantly
+    scores = [llm_score, stylo_score, readability_score]
+    signal_range = max(scores) - min(scores)
+    signals_in_conflict = signal_range > 0.40
 
     attribution_result, confidence_label, transparency_label = _generate_label(combined_score)
 
@@ -24,7 +39,11 @@ def analyze(text: str) -> dict:
         "llm_reasoning": llm_result["reasoning"],
         "stylometric_score": stylo_score,
         "stylometric_metrics": stylo_result["metrics"],
+        "readability_score": readability_score,
+        "readability_metrics": readability_result["metrics"],
         "combined_score": combined_score,
+        "signals_in_conflict": signals_in_conflict,
+        "signal_range": round(signal_range, 4),
         "attribution_result": attribution_result,
         "confidence_label": confidence_label,
         "transparency_label": transparency_label
@@ -64,16 +83,17 @@ def _generate_label(score: float) -> tuple:
 if __name__ == "__main__":
     test_inputs = [
         ("Clearly AI", "Artificial intelligence represents a transformative paradigm shift in modern society. It is important to note that while the benefits of AI are numerous, it is equally essential to consider the ethical implications. Furthermore, stakeholders across various sectors must collaborate to ensure responsible deployment."),
-        ("Clearly human", "ok so i finally tried that new ramen place downtown and honestly? underwhelming. the broth was fine but they put WAY too much sodium in it and i was thirsty for like three hours after. my friend got the spicy version and said it was better. probably won't go back unless someone drags me there"),
+        ("Clearly human", "ok so i finally tried that new ramen place downtown and honestly? underwhelming. the broth was fine but they put WAY too much sodium in it and i was thirsty for like three hours after. my friend got the spicy version and said it was better. probably wont go back unless someone drags me there"),
         ("Borderline formal", "The relationship between monetary policy and asset price inflation has been extensively studied in the literature. Central banks face a fundamental tension between their mandate for price stability and the unintended consequences of prolonged low interest rates on equity and real estate valuations."),
-        ("Borderline edited AI", "I've been thinking a lot about remote work lately. There are genuine tradeoffs — flexibility and no commute on one side, isolation and blurred work-life boundaries on the other. Studies show productivity varies widely by individual and role type.")
+        ("Borderline edited AI", "Ive been thinking a lot about remote work lately. There are genuine tradeoffs — flexibility and no commute on one side, isolation and blurred work-life boundaries on the other. Studies show productivity varies widely by individual and role type.")
     ]
 
     for label, text in test_inputs:
         print(f"\n--- {label} ---")
         result = analyze(text)
-        print(f"LLM Score:         {result['llm_score']}")
-        print(f"Stylometric Score: {result['stylometric_score']}")
-        print(f"Combined Score:    {result['combined_score']}")
-        print(f"Attribution:       {result['attribution_result']}")
-        print(f"Confidence:        {result['confidence_label']}")
+        print(f"LLM:          {result['llm_score']}")
+        print(f"Stylometric:  {result['stylometric_score']}")
+        print(f"Readability:  {result['readability_score']}")
+        print(f"Combined:     {result['combined_score']}")
+        print(f"Conflict:     {result['signals_in_conflict']} (range={result['signal_range']})")
+        print(f"Attribution:  {result['attribution_result']}")

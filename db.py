@@ -43,3 +43,47 @@ def init_db():
 if __name__ == "__main__":
     init_db()
     print("Database initialized.")
+
+
+def init_certificates_table():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS provenance_certificates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            creator_id TEXT NOT NULL UNIQUE,
+            verified_at TEXT NOT NULL,
+            verification_method TEXT NOT NULL,
+            attestation TEXT NOT NULL,
+            status TEXT DEFAULT 'verified'
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def write_certificate(creator_id: str, verification_method: str, attestation: str) -> bool:
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO provenance_certificates (creator_id, verified_at, verification_method, attestation, status)
+            VALUES (?, datetime('now'), ?, ?, 'verified')
+        """, (creator_id, verification_method, attestation))
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def get_certificate(creator_id: str) -> dict | None:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT * FROM provenance_certificates WHERE creator_id = ? AND status = 'verified'
+    """, (creator_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None

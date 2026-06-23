@@ -174,3 +174,50 @@ Provided the Detection Signals section of planning.md and the architecture diagr
 
 Instance 2: Generating the Flask app skeleton and appeals endpoint
 Provided the Architecture Diagram, the Appeals Workflow section, and the API surface definition from planning.md. Asked Claude to generate the full app.py including POST /submit, POST /appeal, and GET /log routes with Flask-Limiter integrated. Reviewed the output and added duplicate appeal detection (the generated version would insert multiple appeal rows for the same content_id) and the 404 guard for appeals submitted against non-existent content IDs before using the code.
+
+---
+
+## Stretch Features
+
+### Ensemble Detection (3 Signals)
+
+The pipeline uses three independent signals weighted as follows:
+
+    Signal                  | Weight | What it captures
+    LLM semantic classifier | 0.50   | Holistic phrasing, coherence, stylistic predictability
+    Stylometric heuristics  | 0.30   | Sentence length variance, vocabulary diversity, punctuation density
+    Readability (Flesch-Kincaid) | 0.20 | Reading ease score — AI text clusters in the 40-65 mid-range
+
+Conflict resolution: when the range between the highest and lowest signal score exceeds 0.40, the response includes `signals_in_conflict: true`. This flags cases where signals disagree significantly — typically formal human writing that the LLM reads as AI-like but the readability signal reads as dense and human-authored. Conflicting signals push results toward the uncertain band by definition (a high LLM score pulled down by a low readability score lands near 0.50). The combined score is always the weighted average — no signal is discarded or overridden.
+
+### Provenance Certificate
+
+Creators can earn a Verified Human certificate via `POST /verify`. The verification step requires a `creator_id` and a written `attestation` (minimum 20 characters) describing their creative process. The system records the attestation, timestamp, and verification method (`self_attestation_v1`).
+
+Once verified, all subsequent submissions from that `creator_id` display a distinct verified label:
+
+    Attribution Notice: This creator has completed identity verification and holds a
+    Verified Human certificate. Content from verified creators is still analyzed, but
+    appeals are prioritized. | Certificate issued: <timestamp> | Confidence: Verified
+
+This label is visually and textually distinct from the three standard transparency label variants. The response also includes `"provenance_certificate": true` and a `certificate` block with the verified timestamp and method.
+
+### Analytics Dashboard
+
+`GET /analytics` returns a live view of detection patterns across all submissions:
+
+- Verdict breakdown (likely_ai / likely_human / uncertain counts and ratios)
+- Appeal rate (total appeals / total submissions)
+- Average confidence score all-time and for the last hour
+- Recent verdict breakdown for the last hour
+
+### Multi-Modal Support
+
+`POST /submit` accepts an optional `image_description` field in addition to or instead of `text`. When present, the image description is passed through a dedicated LLM-based signal (`multimodal_signal.py`) that prompts Groq to assess whether the description reads as AI-generated (formulaic, systematic, exhaustive) or human-written (selective, subjective, irregular focus).
+
+Content type handling:
+- `text` only → standard 3-signal text pipeline
+- `image_description` only → image description signal only, score used directly
+- Both → combined score: `(0.60 x text_pipeline_score) + (0.40 x image_description_score)`
+
+The response includes a `content_type` field (`text`, `image_description`, or `multimodal`) and separate `text_signals` and `image_signals` blocks showing each pipeline's output independently.
