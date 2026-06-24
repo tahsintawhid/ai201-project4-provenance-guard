@@ -6,41 +6,67 @@ A backend system for classifying whether text-based creative content was written
 
 ## Architecture
 
-A submitted piece of text flows through two independent detection signals, whose outputs are combined into a single confidence score. That score maps to one of three transparency label variants, which is returned alongside the attribution result in the API response. Every decision is written to a SQLite audit log. Creators can contest a classification via a separate appeals endpoint, which updates the entry's status and logs their reasoning without triggering automated re-classification.
+A submitted piece of text flows through three independent detection signals, whose outputs are combined into a single confidence score using a weighted ensemble. That score maps to one of three transparency label variants, which is returned alongside the attribution result in the API response. Every decision is written to a SQLite audit log. Creators can contest a classification via a separate appeals endpoint, which updates the entry's status and logs their reasoning without triggering automated re-classification.
 
     POST /submit (text + creator_id)
             |
             v
-    +-------------------+       +------------------------+
-    |  LLM Signal       |       |  Stylometric Signal    |
-    |  (Groq)           |       |  (pure Python)         |
-    |  -> semantic score|       |  -> heuristic score    |
-    +-------------------+       +------------------------+
-            |                           |
-            +----------+----------------+
-                       |
-                       v
-            +---------------------+
-            |  Pipeline Combiner  |
-            |  0.60 x LLM         |
-            |  0.40 x Stylometric |
-            |  -> confidence score|
-            +---------------------+
-                       |
-                       v
-            +---------------------+
-            |  Label Generator    |
-            |  -> transparency    |
-            |    label text       |
-            +---------------------+
-                       |
-                       v
-            +---------------------+
-            |  Audit Log (SQLite) |
-            +---------------------+
-                       |
-                       v
-            JSON response to caller
+    +-------------------+   +------------------------+   +----------------------+
+    |  LLM Signal       |   |  Stylometric Signal    |   |  Readability Signal  |
+    |  (Groq) 0.50      |   |  (pure Python) 0.30    |   |  (Flesch-K) 0.20     |
+    |  -> semantic score|   |  -> heuristic score    |   |  -> readability score|
+    +-------------------+   +------------------------+   +----------------------+
+            |                           |                           |
+            +------------------+--------+---------------------------+
+                               |
+                               v
+                    +---------------------+
+                    |  Pipeline Combiner  |
+                    |  weighted ensemble  |
+                    |  -> confidence score|
+                    +---------------------+
+                               |
+                               v
+                    +---------------------+
+                    |  Label Generator    |
+                    |  -> transparency    |
+                    |    label text       |
+                    +---------------------+
+                               |
+                               v
+                    +---------------------+
+                    |  Audit Log (SQLite) |
+                    +---------------------+
+                               |
+                               v
+                    JSON response to caller
+
+
+    APPEAL FLOW
+    ===========
+
+    POST /appeal (content_id + reasoning)
+            |
+            v
+    +-------------------------+
+    |  Look up content_id     |
+    |  in audit_log           |
+    +-------------------------+
+            |
+            v
+    +-------------------------+
+    |  Update status to       |
+    |  "under_review"         |
+    +-------------------------+
+            |
+            v
+    +-------------------------+
+    |  Write appeal row       |
+    |  to appeals table       |
+    +-------------------------+
+            |
+            v
+    JSON confirmation to caller
 
 ---
 
@@ -72,13 +98,23 @@ What it misses: Unreliable on texts under ~100 words. Fails on stylized human wr
 
 Why this signal: Genuinely independent from the LLM signal. One is semantic, one is structural. Their combination is more informative than either alone, and the stylometric signal adds a free, fast, deterministic check.
 
+### Signal 3: Readability Score — Flesch-Kincaid (Pure Python)
+
+Computes the Flesch Reading Ease score from average words per sentence and average syllables per word. AI text tends to cluster in the 40–65 mid-range — readable but not casual. Very high scores (casual human writing) and very low scores (dense academic writing) both score toward 0.0 (human-like).
+
+What it captures: Reading complexity as a structural signal. AI-generated text is optimized for clarity, producing a predictable readability band. Human writing at either extreme — very casual or very technical — falls outside that band.
+
+What it misses: Formal but human-authored writing (legal documents, academic papers) can look similar to AI output on this metric. Short texts produce unreliable scores.
+
+Why this signal: Genuinely orthogonal to both the LLM and stylometric signals. It measures complexity rather than style or vocabulary, adding a third independent dimension to the ensemble.
+
 ---
 
 ## Confidence Scoring
 
-confidence_score = (0.60 x llm_score) + (0.40 x stylometric_score)
+    confidence_score = (0.50 x llm_score) + (0.30 x stylometric_score) + (0.20 x readability_score)
 
-The LLM signal is weighted higher because it captures holistic properties that heuristics miss. The stylometric signal acts as a structural check.
+The LLM signal is weighted highest because it captures holistic semantic properties that heuristics miss. Stylometric and readability signals provide independent structural checks.
 
 Score range     | Attribution    | Confidence label
 0.00 - 0.35     | likely_human   | high_confidence_human
@@ -87,7 +123,9 @@ Score range     | Attribution    | Confidence label
 
 The uncertain band is intentionally wide. Misclassifying a human writer's work as AI-generated (false positive) is a worse outcome on a creative platform than missing an AI submission. A score of 0.62 produces an uncertain label, not an AI accusation.
 
-Validation: Tested with four deliberately chosen inputs spanning the confidence range — clearly AI-generated text, clearly human informal writing, formal human academic writing, and lightly edited AI output. Scores spread across two distinct tiers (likely_human and uncertain), with the clearly human inputs consistently scoring below 0.25 and the AI/borderline inputs landing between 0.55 and 0.70.
+Conflict detection: when the range between the highest and lowest individual signal score exceeds 0.40, the response includes signals_in_conflict: true. This flags cases where signals disagree significantly and the combined score should be interpreted with extra caution.
+
+Validation: Tested with four deliberately chosen inputs spanning the confidence range — clearly AI-generated text, clearly human informal writing, formal human academic writing, and lightly edited AI output. Clearly human inputs consistently scored below 0.25. AI-like and borderline inputs landed between 0.50 and 0.70.
 
 ---
 
@@ -111,6 +149,12 @@ Validation: Tested with four deliberately chosen inputs spanning the confidence 
 
     Attribution Notice: Our system found no strong indicators of AI generation in this
     content. It appears consistent with human-written work. | Confidence: High
+
+### Verified Human (provenance certificate holder)
+
+    Attribution Notice: This creator has completed identity verification and holds a
+    Verified Human certificate. Content from verified creators is still analyzed, but
+    appeals are prioritized. | Certificate issued: <timestamp> | Confidence: Verified
 
 ---
 
@@ -141,13 +185,19 @@ Reasoning: A real writer submitting their own work might post a few pieces per s
 ## API Reference
 
 ### POST /submit
-Accepts a JSON body with text (string) and creator_id (string). Returns attribution result, confidence score, transparency label, both signal scores, and a content_id for use in appeals.
+Accepts a JSON body with text (string) and/or image_description (string), plus creator_id (string). Returns attribution result, confidence score, transparency label, all three signal scores, conflict flag, and a content_id for use in appeals.
 
 ### POST /appeal
 Accepts content_id (string) and creator_reasoning (string). Updates submission status to under_review and logs the appeal. Returns confirmation.
 
+### POST /verify
+Accepts creator_id (string) and attestation (string, min 20 chars). Issues a Verified Human certificate. Future submissions from this creator_id display the verified label.
+
 ### GET /log
 Returns the most recent audit log entries as structured JSON, including any associated appeal data.
+
+### GET /analytics
+Returns detection patterns, verdict breakdown, appeal rate, and average confidence scores.
 
 ---
 
@@ -155,7 +205,7 @@ Returns the most recent audit log entries as structured JSON, including any asso
 
 Formal human writing is the most likely false positive. The stylometric signal measures statistical regularity — uniform sentence lengths, moderate vocabulary diversity, sparse punctuation — as AI-like. Academic writing, professional essays, and non-native English writers who write in a careful, structured style all share these properties. In testing, a two-sentence excerpt from a monetary policy analysis scored 0.57 (uncertain) despite being clearly human-authored. The LLM signal partially compensates by recognizing domain-specific nuance, but the combined score still lands in the uncertain band. A platform deploying this system should treat the uncertain tier as "no action taken" by default and make the appeals path prominent.
 
-Short texts produce unreliable stylometric scores. Texts under ~100 words do not have enough sentences to compute meaningful variance. The system returns a neutral 0.5 stylometric score for these, which shifts all weight to the LLM signal. This is documented in the code but not surfaced to the API caller — a production version should include a low_confidence_reason field when text length is below threshold.
+Short texts produce unreliable stylometric and readability scores. Texts under ~100 words do not have enough sentences to compute meaningful variance or a stable Flesch score. The system returns a neutral 0.5 stylometric score for these, shifting all weight to the LLM signal. This is documented in the code but not surfaced to the API caller — a production version should include a low_confidence_reason field when text length is below threshold.
 
 ---
 
@@ -183,41 +233,35 @@ Provided the Architecture Diagram, the Appeals Workflow section, and the API sur
 
 The pipeline uses three independent signals weighted as follows:
 
-    Signal                  | Weight | What it captures
-    LLM semantic classifier | 0.50   | Holistic phrasing, coherence, stylistic predictability
-    Stylometric heuristics  | 0.30   | Sentence length variance, vocabulary diversity, punctuation density
-    Readability (Flesch-Kincaid) | 0.20 | Reading ease score — AI text clusters in the 40-65 mid-range
+    Signal                       | Weight | What it captures
+    LLM semantic classifier      | 0.50   | Holistic phrasing, coherence, stylistic predictability
+    Stylometric heuristics       | 0.30   | Sentence length variance, vocabulary diversity, punctuation density
+    Readability (Flesch-Kincaid) | 0.20   | Reading ease score — AI text clusters in the 40-65 mid-range
 
-Conflict resolution: when the range between the highest and lowest signal score exceeds 0.40, the response includes `signals_in_conflict: true`. This flags cases where signals disagree significantly — typically formal human writing that the LLM reads as AI-like but the readability signal reads as dense and human-authored. Conflicting signals push results toward the uncertain band by definition (a high LLM score pulled down by a low readability score lands near 0.50). The combined score is always the weighted average — no signal is discarded or overridden.
+Conflict resolution: when the range between the highest and lowest signal score exceeds 0.40, the response includes signals_in_conflict: true. This flags cases where signals disagree significantly — typically formal human writing that the LLM reads as AI-like but the readability signal reads as dense and human-authored. Conflicting signals push results toward the uncertain band by definition. The combined score is always the weighted average — no signal is discarded or overridden.
 
 ### Provenance Certificate
 
-Creators can earn a Verified Human certificate via `POST /verify`. The verification step requires a `creator_id` and a written `attestation` (minimum 20 characters) describing their creative process. The system records the attestation, timestamp, and verification method (`self_attestation_v1`).
+Creators earn a Verified Human certificate via POST /verify. The verification step requires a creator_id and a written attestation (minimum 20 characters) describing their creative process. The system records the attestation, timestamp, and verification method (self_attestation_v1).
 
-Once verified, all subsequent submissions from that `creator_id` display a distinct verified label:
-
-    Attribution Notice: This creator has completed identity verification and holds a
-    Verified Human certificate. Content from verified creators is still analyzed, but
-    appeals are prioritized. | Certificate issued: <timestamp> | Confidence: Verified
-
-This label is visually and textually distinct from the three standard transparency label variants. The response also includes `"provenance_certificate": true` and a `certificate` block with the verified timestamp and method.
+Once verified, all subsequent submissions from that creator_id display a distinct verified label that is textually and structurally different from all three standard transparency label variants. The response includes provenance_certificate: true and a certificate block showing the verified timestamp and method.
 
 ### Analytics Dashboard
 
-`GET /analytics` returns a live view of detection patterns across all submissions:
+GET /analytics returns a live view of detection patterns across all submissions:
 
-- Verdict breakdown (likely_ai / likely_human / uncertain counts and ratios)
-- Appeal rate (total appeals / total submissions)
+- Verdict breakdown: likely_ai / likely_human / uncertain counts and ratios
+- Appeal rate: total appeals divided by total submissions
 - Average confidence score all-time and for the last hour
 - Recent verdict breakdown for the last hour
 
 ### Multi-Modal Support
 
-`POST /submit` accepts an optional `image_description` field in addition to or instead of `text`. When present, the image description is passed through a dedicated LLM-based signal (`multimodal_signal.py`) that prompts Groq to assess whether the description reads as AI-generated (formulaic, systematic, exhaustive) or human-written (selective, subjective, irregular focus).
+POST /submit accepts an optional image_description field in addition to or instead of text. When present, the image description is passed through a dedicated LLM-based signal (multimodal_signal.py) that prompts Groq to assess whether the description reads as AI-generated (formulaic, systematic, exhaustive) or human-written (selective, subjective, irregular focus).
 
 Content type handling:
-- `text` only → standard 3-signal text pipeline
-- `image_description` only → image description signal only, score used directly
-- Both → combined score: `(0.60 x text_pipeline_score) + (0.40 x image_description_score)`
+- text only: standard 3-signal text pipeline
+- image_description only: image description signal only, score used directly
+- both: combined score using (0.60 x text_pipeline_score) + (0.40 x image_description_score)
 
-The response includes a `content_type` field (`text`, `image_description`, or `multimodal`) and separate `text_signals` and `image_signals` blocks showing each pipeline's output independently.
+The response includes a content_type field (text, image_description, or multimodal) and separate text_signals and image_signals blocks showing each pipeline's output independently.
